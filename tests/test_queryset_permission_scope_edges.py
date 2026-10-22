@@ -244,7 +244,7 @@ def test_arrow_via_undeclared_relation_compiles_to_static_deny(storage):
 def test_expiry_filter_binds_app_clock_not_database_clock(storage):
     """The SQL expiry predicate binds the app clock, matching the graph path.
 
-    ``local._filter_active`` (used by ``accessible()`` and the enumeration
+    ``local._is_active`` (used by ``accessible()`` and the enumeration
     fallback) filters expiry with ``timezone.now()``. The compiled predicate
     must bind that same app-server clock, not the database clock (``Now()``),
     or the two evaluation strategies disagree inside the app/DB clock-skew

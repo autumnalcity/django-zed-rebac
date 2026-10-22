@@ -104,6 +104,7 @@ class PermissionEvaluator:
         "_accessible_cache",
         "_check_cache",
         "_max_size",
+        "_predicate_template_count",
         "_predicate_templates",
         "_schema_scope",
     )
@@ -114,6 +115,7 @@ class PermissionEvaluator:
         self._max_size = max_size
         self._schema_scope = SchemaScope()
         self._predicate_templates: dict[tuple[Any, ...], tuple[Any, dict[Any, Any]]] = {}
+        self._predicate_template_count = 0
 
     # ----- public API -----
 
@@ -221,6 +223,7 @@ class PermissionEvaluator:
         self._accessible_cache.clear()
         self._schema_scope.clear()
         self._predicate_templates.clear()
+        self._predicate_template_count = 0
 
     # ----- introspection (for tests + debugging) -----
 
@@ -298,6 +301,8 @@ def evaluator_scope(
         evaluator._schema_scope.users -= 1
         if evaluator._schema_scope.users == 0:
             evaluator._schema_scope.clear()
+            evaluator._predicate_templates.clear()
+            evaluator._predicate_template_count = 0
         try:
             _current_evaluator.reset(token)
         except ValueError:

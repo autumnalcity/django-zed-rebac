@@ -39,7 +39,6 @@ from typing import Any, NamedTuple, cast
 from weakref import WeakSet
 
 from django.db import models
-from django.db.models import QuerySet
 
 from ..conf import app_settings
 from ..errors import PermissionDepthExceeded, SchemaError
@@ -139,8 +138,9 @@ def _schema_operation[**P, R](method: Callable[P, R]) -> Callable[P, R]:
     def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
         token = None
         tuple_token = None
-        if _tuple_reads.get() is None:
-            tuple_token = _tuple_reads.set({})
+        current = _tuple_reads.get()
+        if current is None or not current.get("active"):
+            tuple_token = _tuple_reads.set({"active": True})
         if _schema_operation_scope.get() is None:
             token = _schema_operation_scope.set(SchemaScope())
         try:
@@ -149,6 +149,7 @@ def _schema_operation[**P, R](method: Callable[P, R]) -> Callable[P, R]:
             if tuple_token is not None:
                 facts = _tuple_reads.get()
                 if facts is not None:
+                    facts["active"] = False
                     for connection, observer in facts.get("observers", {}).items():
                         connection.execute_wrappers[:] = [
                             w for w in connection.execute_wrappers if w is not observer
@@ -628,10 +629,7 @@ class LocalBackend(Backend):
     ) -> Iterable[SubjectRef]:
         # Minimal forward lookup — direct relation rows only. Walking through
         # subject sets / arrows for reverse lookup is deferred to v0.2.
-        from ..models import active_relationship_model
-
         self._validate_consistency(consistency, at_zookie)
-        RelationshipModel = active_relationship_model()
 
         permission = self.schema().get_permission(resource.resource_type, action)
         definition = self.schema().get_definition(resource.resource_type)
@@ -693,13 +691,13 @@ class LocalBackend(Backend):
 
         candidates = set(synthetic_subjects)
         if stored_relation_names:
-            rows = _filter_active(
-                RelationshipModel.objects.filter(
-                    resource_type=resource.resource_type,
-                    resource_id=resource.resource_id,
-                    relation__in=stored_relation_names,
-                    subject_type=subject_type,
-                )
+            rows = (
+                row
+                for name in stored_relation_names
+                for row in self._stored_rows(resource.resource_type, name)
+                if row.resource_id == resource.resource_id
+                and row.subject_type == subject_type
+                and _is_active(row)
             )
             candidates.update(
                 SubjectRef.of(r.subject_type, r.subject_id, r.optional_subject_relation)
@@ -884,6 +882,8 @@ class LocalBackend(Backend):
         connection = connections[alias]
         key = (connection, model, _relationship_generation)
         facts = _tuple_reads.get()
+        if facts is not None and not facts.get("active"):
+            facts = None
         if facts is not None:
             observers = facts.setdefault("observers", {})
             if connection not in observers:
@@ -895,7 +895,7 @@ class LocalBackend(Backend):
                     # Facts are not reused across public operations anyway.
                     if many or not str(sql).lstrip().upper().startswith("SELECT "):
                         for item in list(facts):
-                            if item != "observers":
+                            if item not in {"observers", "active"}:
                                 del facts[item]
                     return execute(sql, params, many, context)
 
@@ -2025,14 +2025,6 @@ def _collect_direct_relations(expr: PermExpr) -> set[str]:
     if isinstance(expr, PermBinOp):
         return _collect_direct_relations(expr.left) | _collect_direct_relations(expr.right)
     return set()
-
-
-def _filter_active(qs: QuerySet[Any]) -> QuerySet[Any]:
-    """Exclude expired rows. Postgres-friendly via a parameterised filter."""
-    from django.db.models import Q
-    from django.utils import timezone
-
-    return qs.filter(Q(expires_at__isnull=True) | Q(expires_at__gt=timezone.now()))
 
 
 def _is_active(row: object) -> bool:

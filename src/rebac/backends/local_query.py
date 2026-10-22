@@ -100,6 +100,13 @@ class ConvertedRelationIds(models.Expression):
         return result
 
     def as_sql(self, compiler: Any, connection: Any) -> tuple[str, tuple[Any, ...]]:
+        # Compilation happens after queryset_filter() returns. Use the same
+        # native operation owner for delayed tuple reads, not a decision cache.
+        from .local import _schema_operation
+
+        return _schema_operation(self._compile_sql)(compiler, connection)
+
+    def _compile_sql(self, compiler: Any, connection: Any) -> tuple[str, tuple[Any, ...]]:
         # Resolve tuple-derived grants from the SAME database the surrounding
         # predicate joins against (``self.scope.using``), not the default alias,
         # so multi-database scoping stays consistent with the native EXISTS
@@ -155,8 +162,20 @@ def _memoized(method: Callable[..., Q]) -> Callable[..., Q]:
         if key in self.memo:
             return self.memo[key]
         value = method(self, *args)
-        if len(self.memo) < app_settings.REBAC_EVALUATOR_CACHE_SIZE:
+        limit = (
+            self.evaluator._max_size
+            if self.evaluator is not None
+            else app_settings.REBAC_EVALUATOR_CACHE_SIZE
+        )
+        used = (
+            self.evaluator._predicate_template_count
+            if self.evaluator is not None
+            else len(self.memo)
+        )
+        if used < limit:
             self.memo[key] = value
+            if self.evaluator is not None:
+                self.evaluator._predicate_template_count += 1
         return value
 
     return wrapped
@@ -177,21 +196,28 @@ class LocalQueryScope:
         snapshot = backend._schema_snapshot()
         self.schema = snapshot.schema
         self.memo: dict[tuple[Any, ...], Q] = {}
-        from ..evaluator import current_evaluator
+        from ..evaluator import _BackendKey, current_evaluator
 
         evaluator = current_evaluator()
+        self.evaluator = evaluator
         if evaluator is not None:
             # Strong schema reference prevents identity reuse after invalidation.
             # Actor/connection/schema/bindings are fixed for this template set;
             # permission(), branch() add model, identity and full recursion state.
             key = (
-                id(backend),
+                _BackendKey(backend),
                 snapshot.generation,
                 snapshot.invalidation_generation,
                 id(self.schema),
                 subject,
                 connections[using],
                 app_settings.REBAC_DEPTH_LIMIT,
+                active_relationship_model(),
+                app_settings.REBAC_RESOURCE_ID_ATTR,
+                app_settings.REBAC_USER_ID_ATTR,
+                app_settings.REBAC_USER_TYPE,
+                app_settings.REBAC_GROUP_TYPE,
+                app_settings.REBAC_TYPE_PREFIX,
             )
             if len(evaluator._predicate_templates) < app_settings.REBAC_EVALUATOR_CACHE_SIZE:
                 _, self.memo = evaluator._predicate_templates.setdefault(key, (self.schema, {}))
@@ -480,7 +506,7 @@ class LocalQueryScope:
         if relation.with_expiration:
             # Bind the app-server clock (``timezone.now()``) rather than the
             # database clock (``Now()``): the graph/enumeration path filters
-            # expiry with ``timezone.now()`` (see ``local._filter_active``), so
+            # expiry with ``timezone.now()`` (see ``local._is_active``), so
             # using the DB clock here would let the two evaluation strategies
             # disagree inside the app/DB clock-skew window and break the
             # ``accessible() == queryset`` parity contract.

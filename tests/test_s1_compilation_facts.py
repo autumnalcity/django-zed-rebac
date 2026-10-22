@@ -149,3 +149,51 @@ def test_templates_reuse_without_decisions_or_stale_backing(local):
         assert LocalQueryScope(local, ACTOR, "default").memo is not previous
         evaluator.invalidate()
         assert not evaluator._predicate_templates
+
+
+def test_template_budget_and_scope_teardown(local):
+    from rebac.evaluator import PermissionEvaluator
+
+    evaluator = PermissionEvaluator(max_size=3)
+    with evaluator_scope(evaluator):
+        scope = LocalQueryScope(local, ACTOR, "default")
+        scope.predicate(Post, "read", "blog/post")
+        assert evaluator._predicate_template_count <= 3
+        assert sum(len(v[1]) for v in evaluator._predicate_templates.values()) <= 3
+    assert not evaluator._predicate_templates
+    assert evaluator._predicate_template_count == 0
+
+
+def test_copied_context_cannot_reuse_finished_operation(local):
+    from contextvars import copy_context
+
+    from rebac.models import active_relationship_model
+
+    @_schema_operation
+    def capture(engine):
+        assert engine.check_access(subject=ACTOR, resource=RESOURCE, action="read").allowed
+        return copy_context()
+
+    copied = capture(local)
+    table = connection.ops.quote_name(active_relationship_model()._meta.db_table)
+    with connection.cursor() as cursor:
+        cursor.execute("DELETE FROM " + table)
+    assert not copied.run(
+        local.check_access, subject=ACTOR, resource=RESOURCE, action="read"
+    ).allowed
+
+
+def test_template_separates_native_binding_configuration(local):
+    with evaluator_scope():
+        first = LocalQueryScope(local, ACTOR, "default")
+        first.predicate(Post, "read", "blog/post")
+        storage = (
+            "registry"
+            if first.relationships.model._meta.model_name == "relationship"
+            else "denormalized"
+        )
+        with override_settings(REBAC_LOCAL_BACKEND_STORAGE=storage):
+            second = LocalQueryScope(local, ACTOR, "default")
+            assert second.memo is not first.memo
+        with override_settings(REBAC_RESOURCE_ID_ATTR="title"):
+            assert LocalQueryScope(local, ACTOR, "default").memo is not first.memo
