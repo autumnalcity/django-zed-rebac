@@ -280,8 +280,8 @@ def test_attribute_arrow_check_is_bounded_when_enumeration_is_exact(
 
     Resolving the targets the subject holds ``reach`` on costs one query when
     the set is empty (the check then denies without touching the container)
-    and two when it is not (the enumeration's fix-point confirms the set is
-    closed); one EXISTS then intersects it with the live container. Neither
+    and still one when it is not (the fix-point reuses the operation's raw
+    tuples); one EXISTS then intersects it with the live container. Neither
     depends on how wide the container is or on filters joining duplicate rows.
     """
     reset_backend()
@@ -308,7 +308,7 @@ def test_attribute_arrow_check_is_bounded_when_enumeration_is_exact(
     write_relationships(
         [RelationshipTuple(ObjectRef("auth/user", str(staff[0].pk)), "self", subject)]
     )
-    with django_assert_num_queries(3):
+    with django_assert_num_queries(2):
         assert (
             backend()
             .check_access(subject=subject, action="read", resource=ObjectRef("blog/post", "one"))
@@ -325,8 +325,9 @@ def test_attribute_arrow_walk_keeps_tri_state_per_target_under_caveats(
     Enumeration drops conditional rows, so the walk must stay per target to
     preserve CONDITIONAL. Cost model: one query for the distinct container
     subjects, then the target permission per subject; ``reach = self`` is a
-    stored relation the tri-state evaluator denies with three queries.
-    Duplicate-producing filters must not multiply that.
+    stored relation whose tuples are loaded once for the whole operation.
+    The second query reads the distinct live container subjects. Neither
+    duplicate-producing filters nor target count multiply tuple selections.
     """
     reset_backend()
     backend().set_schema(parse_zed(CAVEATED_ARROW_SCHEMA))
@@ -342,7 +343,7 @@ def test_attribute_arrow_walk_keeps_tri_state_per_target_under_caveats(
             AuthoredPost.objects.create(title="k-two", folder=folder, author=member)
     subject = to_subject_ref(reader)
 
-    with django_assert_num_queries(1 + 3 * len(staff)):
+    with django_assert_num_queries(2):
         assert (
             not backend()
             .check_access(subject=subject, action="read", resource=ObjectRef("blog/post", "one"))

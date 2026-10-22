@@ -34,7 +34,8 @@ from contextvars import ContextVar
 from datetime import datetime
 from functools import wraps
 from threading import Lock
-from typing import Any, NamedTuple
+from types import SimpleNamespace
+from typing import Any, NamedTuple, cast
 from weakref import WeakSet
 
 from django.db import models
@@ -113,6 +114,7 @@ class _SchemaFacts(NamedTuple):
 
 
 _relationship_generation = 0
+_tuple_reads: ContextVar[dict[Any, Any] | None] = ContextVar("rebac_tuple_reads", default=None)
 _schema_operation_scope: ContextVar[SchemaScope | None] = ContextVar(
     "rebac_schema_operation", default=None
 )
@@ -136,11 +138,22 @@ def _schema_operation[**P, R](method: Callable[P, R]) -> Callable[P, R]:
     @wraps(method)
     def wrapped(*args: P.args, **kwargs: P.kwargs) -> R:
         token = None
+        tuple_token = None
+        if _tuple_reads.get() is None:
+            tuple_token = _tuple_reads.set({})
         if _schema_operation_scope.get() is None:
             token = _schema_operation_scope.set(SchemaScope())
         try:
             return method(*args, **kwargs)
         finally:
+            if tuple_token is not None:
+                facts = _tuple_reads.get()
+                if facts is not None:
+                    for connection, observer in facts.get("observers", {}).items():
+                        connection.execute_wrappers[:] = [
+                            w for w in connection.execute_wrappers if w is not observer
+                        ]
+                _tuple_reads.reset(tuple_token)
             if token is not None:
                 scope = _schema_operation_scope.get()
                 if scope is not None:
@@ -852,6 +865,65 @@ class LocalBackend(Backend):
             ctx=ctx,
         )
 
+    def _stored_rows(
+        self, resource_type: str, relation: str, *, using: str | None = None
+    ) -> tuple[SimpleNamespace, ...]:
+        """Raw tuple facts for one native operation, never an authorization result.
+
+        Operation lifetime preserves READ COMMITTED freshness between public
+        checks (including writes from other processes). Native writes inside
+        an operation change the generation before any facts can be reused.
+        Expiration/caveats and all ORM backing are evaluated by their owners.
+        """
+        from django.db import DEFAULT_DB_ALIAS, connections
+
+        from ..models import active_relationship_model
+
+        alias = using or DEFAULT_DB_ALIAS
+        model = active_relationship_model()
+        connection = connections[alias]
+        key = (connection, model, _relationship_generation)
+        facts = _tuple_reads.get()
+        if facts is not None:
+            observers = facts.setdefault("observers", {})
+            if connection not in observers:
+
+                def observe(
+                    execute: Callable[..., Any], sql: str, params: Any, many: bool, context: Any
+                ) -> Any:
+                    # Conservative for raw writes, rollback and vendor SQL.
+                    # Facts are not reused across public operations anyway.
+                    if many or not str(sql).lstrip().upper().startswith("SELECT "):
+                        for item in list(facts):
+                            if item != "observers":
+                                del facts[item]
+                    return execute(sql, params, many, context)
+
+                connection.execute_wrappers.insert(0, observe)
+                observers[connection] = observe
+        if facts is not None and key in facts:
+            return cast(tuple[SimpleNamespace, ...], facts[key].get((resource_type, relation), ()))
+        values = model.objects.using(alias).values(
+            "resource_type",
+            "resource_id",
+            "relation",
+            "subject_type",
+            "subject_id",
+            "optional_subject_relation",
+            "caveat_name",
+            "caveat_context",
+            "expires_at",
+        )
+        grouped: dict[tuple[str, str], list[SimpleNamespace]] = {}
+        for row in values:
+            grouped.setdefault((row["resource_type"], row["relation"]), []).append(
+                SimpleNamespace(**row)
+            )
+        rows = {key: tuple(values) for key, values in grouped.items()}
+        if facts is not None:
+            facts[key] = rows
+        return rows.get((resource_type, relation), ())
+
     def _walk_resolve_relation(
         self,
         ctx: WalkContext,
@@ -879,7 +951,6 @@ class LocalBackend(Backend):
         target: str,
         depth: int,
     ) -> bool | None:
-        from ..models import active_relationship_model
 
         via_relation = _find_relation(definition, via)
         if via_relation is None:
@@ -913,14 +984,15 @@ class LocalBackend(Backend):
                 depth=depth,
             )
 
-        RelationshipModel = active_relationship_model()
-        targets = RelationshipModel.objects.filter(
-            resource_type=definition.resource_type,
-            resource_id=resource_id,
-            relation=via,
+        targets = (
+            row
+            for row in self._stored_rows(definition.resource_type, via)
+            if row.resource_id == resource_id
         )
         saw_conditional = False
-        for row in _filter_active(targets):
+        for row in targets:
+            if not _is_active(row):
+                continue
             if not _row_allowed_by_relation(via_relation, row):
                 continue
             # The hop row itself may carry a caveat — evaluate it before
@@ -1196,7 +1268,6 @@ class LocalBackend(Backend):
             raise PermissionDepthExceeded(f"Depth limit {app_settings.REBAC_DEPTH_LIMIT} exceeded")
         if missing is None:
             missing = set()
-        from ..models import active_relationship_model
 
         definition = self.schema().get_definition(resource_type)
         if definition is None:
@@ -1227,21 +1298,20 @@ class LocalBackend(Backend):
                 const_backing.target_resource_type, const_backing.target_id
             )
 
-        RelationshipModel = active_relationship_model()
-
-        rows = RelationshipModel.objects.filter(
-            resource_type=resource_type,
-            resource_id=resource_id,
-            relation=relation,
+        rows = tuple(
+            row
+            for row in self._stored_rows(resource_type, relation)
+            if row.resource_id == resource_id
         )
         saw_conditional = False
         # Direct subject match
-        direct = _filter_active(
-            rows.filter(
-                subject_type=subject.subject_type,
-                subject_id=subject.subject_id,
-                optional_subject_relation=subject.optional_relation,
-            )
+        direct = (
+            r
+            for r in rows
+            if _is_active(r)
+            and r.subject_type == subject.subject_type
+            and r.subject_id == subject.subject_id
+            and r.optional_subject_relation == subject.optional_relation
         )
         for row in direct:
             if not _row_allowed_by_relation(relation_def, row):
@@ -1255,11 +1325,10 @@ class LocalBackend(Backend):
         # Wildcard match on (subject_type, "*"). Only valid for direct subject
         # types (not subject sets).
         if not subject.optional_relation:
-            wildcard = _filter_active(
-                rows.filter(
-                    subject_type=subject.subject_type,
-                    subject_id="*",
-                )
+            wildcard = (
+                r
+                for r in rows
+                if _is_active(r) and r.subject_type == subject.subject_type and r.subject_id == "*"
             )
             for row in wildcard:
                 if not _row_allowed_by_relation(relation_def, row):
@@ -1272,7 +1341,9 @@ class LocalBackend(Backend):
 
         # Subject-set rows: e.g. `viewer @ auth/group:eng#member`. Walk the
         # group's `member` relation and see if subject is a member.
-        for row in rows.exclude(optional_subject_relation=""):
+        for row in rows:
+            if not row.optional_subject_relation:
+                continue
             if not _row_allowed_by_relation(relation_def, row):
                 continue
             if not _is_active(row):
@@ -1798,23 +1869,21 @@ class LocalBackend(Backend):
         using: str | None,
     ) -> set[str]:
         """Evaluate persisted rows for ordinary and fixed-backing fallback paths."""
-        from ..models import active_relationship_model
-
-        RelationshipModel = active_relationship_model()
         result: set[str] = set()
         # Caveat-conditional rows feeding accessible() are excluded silently.
         sink: set[str] = set()
 
-        direct = self._maybe_using(RelationshipModel.objects, using).filter(
-            resource_type=resource_type,
-            relation=relation.name,
-            subject_type=subject.subject_type,
-            subject_id=subject.subject_id,
-            optional_subject_relation=subject.optional_relation,
+        rows = self._stored_rows(resource_type, relation.name, using=using)
+        direct = (
+            r
+            for r in rows
+            if _is_active(r)
+            and r.subject_type == subject.subject_type
+            and r.subject_id == subject.subject_id
+            and r.optional_subject_relation == subject.optional_relation
+            and _subject_allowed_by_relation(relation, subject)
         )
-        if not _subject_allowed_by_relation(relation, subject):
-            direct = direct.none()
-        for row in _filter_active(direct):
+        for row in direct:
             if not _row_allowed_by_relation(relation, row):
                 continue
             if self._evaluate_row_caveat(row, context, sink) is True:
@@ -1823,13 +1892,12 @@ class LocalBackend(Backend):
         if not subject.optional_relation and _subject_allowed_by_relation(
             relation, SubjectRef.of(subject.subject_type, "*")
         ):
-            wildcard = self._maybe_using(RelationshipModel.objects, using).filter(
-                resource_type=resource_type,
-                relation=relation.name,
-                subject_type=subject.subject_type,
-                subject_id="*",
+            wildcard = (
+                r
+                for r in rows
+                if _is_active(r) and r.subject_type == subject.subject_type and r.subject_id == "*"
             )
-            for row in _filter_active(wildcard):
+            for row in wildcard:
                 if not _row_allowed_by_relation(relation, row):
                     continue
                 if self._evaluate_row_caveat(row, context, sink) is True:
@@ -1837,11 +1905,7 @@ class LocalBackend(Backend):
 
         if not any(allowed.relation for allowed in relation.allowed_subjects):
             return result
-        subject_sets = (
-            self._maybe_using(RelationshipModel.objects, using)
-            .filter(resource_type=resource_type, relation=relation.name)
-            .exclude(optional_subject_relation="")
-        )
+        subject_sets = (r for r in rows if r.optional_subject_relation)
         for row in subject_sets:
             if not _row_allowed_by_relation(relation, row):
                 continue
@@ -1874,9 +1938,6 @@ class LocalBackend(Backend):
         context: dict[str, Any] | None,
         using: str | None,
     ) -> set[str]:
-        from ..models import active_relationship_model
-
-        RelationshipModel = active_relationship_model()
         results: set[str] = set()
         for target_type in sorted({item.type for item in via_relation.allowed_subjects}):
             target_definition = self.schema().get_definition(target_type)
@@ -1892,13 +1953,12 @@ class LocalBackend(Backend):
                 context,
                 using,
             )
-            rows = self._maybe_using(RelationshipModel.objects, using).filter(
-                resource_type=definition.resource_type,
-                relation=via_relation.name,
-                subject_type=target_type,
-                subject_id__in=target_ids,
+            rows = (
+                r
+                for r in self._stored_rows(definition.resource_type, via_relation.name, using=using)
+                if r.subject_type == target_type and r.subject_id in target_ids and _is_active(r)
             )
-            for row in _filter_active(rows):
+            for row in rows:
                 if _row_allowed_by_relation(via_relation, row):
                     sink: set[str] = set()
                     if self._evaluate_row_caveat(row, context, sink) is True:

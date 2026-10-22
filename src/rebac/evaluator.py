@@ -100,13 +100,20 @@ class PermissionEvaluator:
     supported for tests.
     """
 
-    __slots__ = ("_accessible_cache", "_check_cache", "_max_size", "_schema_scope")
+    __slots__ = (
+        "_accessible_cache",
+        "_check_cache",
+        "_max_size",
+        "_predicate_templates",
+        "_schema_scope",
+    )
 
     def __init__(self, *, max_size: int = 10_000) -> None:
         self._check_cache: OrderedDict[tuple[Any, ...], CheckResult] = OrderedDict()
         self._accessible_cache: OrderedDict[tuple[Any, ...], tuple[str, ...]] = OrderedDict()
         self._max_size = max_size
         self._schema_scope = SchemaScope()
+        self._predicate_templates: dict[tuple[Any, ...], tuple[Any, dict[Any, Any]]] = {}
 
     # ----- public API -----
 
@@ -213,6 +220,7 @@ class PermissionEvaluator:
         self._check_cache.clear()
         self._accessible_cache.clear()
         self._schema_scope.clear()
+        self._predicate_templates.clear()
 
     # ----- introspection (for tests + debugging) -----
 

@@ -1264,6 +1264,21 @@ like the previous implementation, an eagerly applied blanket grant is a scope
 snapshot. Tuple predicates and conversion fallbacks recheck their rows before SQL
 execution. Existing evaluated Django result caches are not refreshed implicitly.
 
+The local evaluator reuses raw persisted tuples per type/relation and database
+within one public engine operation. This is not an allow/deny cache: caveats,
+expiry and backed fields are evaluated normally. Facts never survive the
+operation in READ COMMITTED, so a later public check sees other transactions'
+commits. A native relationship write advances the existing generation and
+invalidates nested-operation reuse. The decision-cache transaction bypass is
+unchanged. No tuple snapshot is inserted into lazy SQL predicates.
+
+Within one evaluator lifetime, permission/branch memo keys include the full recursion
+set, model and identity expression; schema/bindings, actor, backend and alias
+are included in the evaluator template-set key. Independent deep copies retain lazy converted-identity
+resolvers without copying their engine or connection. Unsupported branches are
+never cached. Expiring schemas use stock construction to keep clock cutoffs
+fresh. No template survives its evaluator or explicit invalidation; schema generations are isolated.
+
 Same-definition permission-alias cycles deny the repeated branch in both
 queryset fallback and individual checks; they cannot cause Python recursion.
 

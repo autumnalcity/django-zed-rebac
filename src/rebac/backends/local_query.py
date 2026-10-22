@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from copy import deepcopy
+from functools import wraps
 from typing import TYPE_CHECKING, Any, cast
 
 from django.core.exceptions import FieldDoesNotExist
@@ -87,6 +90,15 @@ class ConvertedRelationIds(models.Expression):
         self.id_attr = identity
         self.target = target
 
+    def __deepcopy__(self, memo: dict[int, Any]) -> ConvertedRelationIds:
+        # Clone the expression, never the engine/connection behind its lazy
+        # resolver. Every execution still resolves current tuples on this alias.
+        result = type(self)(
+            self.scope, self.definition, self.relation, self.model, self.id_attr, self.target
+        )
+        memo[id(self)] = result
+        return result
+
     def as_sql(self, compiler: Any, connection: Any) -> tuple[str, tuple[Any, ...]]:
         # Resolve tuple-derived grants from the SAME database the surrounding
         # predicate joins against (``self.scope.using``), not the default alias,
@@ -123,6 +135,33 @@ class ConvertedRelationIds(models.Expression):
         return str(sql), tuple(params)
 
 
+def _memoized(method: Callable[..., Q]) -> Callable[..., Q]:
+    """Reuse internal immutable templates inside one evaluator lifetime.
+
+    The evaluator key fixes schema/bindings, backend, actor and connection. Arguments
+    include model, scalar identity and exact recursion state. Never cache a
+    fallback, converted identity, time-dependent predicate or a decision.
+    """
+
+    @wraps(method)
+    def wrapped(self: LocalQueryScope, *args: Any) -> Q:
+        if not self.memo_enabled:
+            return method(self, *args)
+        key = (method.__name__, *args)
+        try:
+            hash(key)
+        except TypeError:
+            return method(self, *args)
+        if key in self.memo:
+            return self.memo[key]
+        value = method(self, *args)
+        if len(self.memo) < app_settings.REBAC_EVALUATOR_CACHE_SIZE:
+            self.memo[key] = value
+        return value
+
+    return wrapped
+
+
 class LocalQueryScope:
     """Compile schema membership without enumerating the matching resources.
 
@@ -135,7 +174,31 @@ class LocalQueryScope:
         from ..models import active_relationship_model
 
         self.backend = backend
-        self.schema = backend.schema()
+        snapshot = backend._schema_snapshot()
+        self.schema = snapshot.schema
+        self.memo: dict[tuple[Any, ...], Q] = {}
+        from ..evaluator import current_evaluator
+
+        evaluator = current_evaluator()
+        if evaluator is not None:
+            # Strong schema reference prevents identity reuse after invalidation.
+            # Actor/connection/schema/bindings are fixed for this template set;
+            # permission(), branch() add model, identity and full recursion state.
+            key = (
+                id(backend),
+                snapshot.generation,
+                snapshot.invalidation_generation,
+                id(self.schema),
+                subject,
+                connections[using],
+                app_settings.REBAC_DEPTH_LIMIT,
+            )
+            if len(evaluator._predicate_templates) < app_settings.REBAC_EVALUATOR_CACHE_SIZE:
+                _, self.memo = evaluator._predicate_templates.setdefault(key, (self.schema, {}))
+        # Expiring branches embed a clock value. Keep their native construction.
+        self.memo_enabled = not any(
+            r.with_expiration for d in self.schema.definitions for r in d.relations
+        )
         self.subject = subject
         self.using = using
         rows = cast(
@@ -145,8 +208,11 @@ class LocalQueryScope:
         self.relationships = rows.with_wire_ids()
 
     def predicate(self, model: type[models.Model], action: str, resource_type: str) -> Q:
-        return self.permission(resource_type, action, model, resource_id_attr(model), frozenset())
+        return deepcopy(
+            self.permission(resource_type, action, model, resource_id_attr(model), frozenset())
+        )
 
+    @_memoized
     def permission(
         self,
         resource_type: str,
@@ -202,6 +268,7 @@ class LocalQueryScope:
             return self.relation(definition, relation, model, identity, seen, target=expr.target)
         raise UnsupportedScope
 
+    @_memoized
     def branch(
         self,
         expr: PermExpr,
